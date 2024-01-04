@@ -2,7 +2,10 @@ package wal_clone
 
 import (
 	"errors"
+	"github.com/tidwall/tinylru"
 	"os"
+	"path/filepath"
+	"sync"
 )
 
 // defining all the errors possible
@@ -73,4 +76,88 @@ var DefaultOptions = &Options{
 	NoCopy:           false,    // Make a new copy of data for every Read call.
 	DirPerms:         0750,     // Permissions for the created directories
 	FilePerms:        0640,     // Permissions for the created data files
+}
+
+// Log represents a write ahead log
+type Log struct {
+	mu         sync.RWMutex
+	path       string
+	opts       Options
+	firstIndex int
+	lastIndex  int
+	segments   []*segment
+	closed     bool
+	corrupt    bool
+	sfile      *os.File
+	wbatch     Batch
+	scache     tinylru.LRU
+}
+
+// segment represents a single segment file
+type segment struct {
+	path  string
+	index uint64
+	ebuf  []byte
+	epos  []bpos
+}
+
+type bpos struct {
+	pos int // byte position
+	end int // one byte pos
+}
+
+// Open a new write ahead log
+func Open(path string, opts *Options) (*Log, error) {
+	if opts == nil {
+		opts = DefaultOptions
+	}
+	if opts.SegmentCacheSize <= 0 {
+		opts.SegmentCacheSize = DefaultOptions.SegmentCacheSize
+	}
+	if opts.SegmentSize <= 0 {
+		opts.SegmentSize = DefaultOptions.SegmentSize
+	}
+	if opts.DirPerms == 0 {
+		opts.DirPerms = DefaultOptions.DirPerms
+	}
+	if opts.FilePerms == 0 {
+		opts.FilePerms = DefaultOptions.FilePerms
+	}
+
+	var err error
+	path, err = absPath(path)
+	if err != nil {
+		return nil, err
+	}
+	l := &Log{path: path, opts: *opts}
+	l.scache.Resize(l.opts.SegmentCacheSize)
+	if err := os.MkdirAll(path, l.opts.DirPerms); err != nil {
+		return nil, err
+	}
+	if err := l.load(); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+func absPath(path string) (string, error) {
+	if path == ":memory:" {
+		return "", errors.New("in memory log is not supported")
+	}
+	return filepath.Abs(path)
+}
+
+// Sync performs the fsync on the log. What it means is that wheneber a log is written it will send it to the os to
+// write and performs flush over the os cache to persist to the disk. It slowes down the writing operation
+func (l *Log) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.corrupt {
+		return ErrCorrupt
+	}
+	if l.closed {
+		return ErrClosed
+	}
+	return l.sfile.Sync()
 }
